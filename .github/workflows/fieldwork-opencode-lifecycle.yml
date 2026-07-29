@@ -1,0 +1,51 @@
+name: Fieldwork OpenCode lifecycle
+
+on:
+  push:
+    branches:
+      - fieldwork/opencode-completion-reconciliation
+    paths:
+      - apps/server/src/provider/Layers/OpenCodeAdapter.restart.test.ts
+      - apps/server/src/provider/Layers/OpenCodeAdapter.interrupt.test.ts
+      - apps/server/src/provider/Layers/OpenCodeAdapter.steering-affinity.test.ts
+      - apps/server/src/provider/Layers/ProviderSessionReaper.race.test.ts
+      - .github/workflows/fieldwork-opencode-lifecycle.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fieldwork-opencode-lifecycle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  focused-test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Restart reconciliation
+            test: apps/server/src/provider/Layers/OpenCodeAdapter.restart.test.ts
+          - name: Interrupt settlement
+            test: apps/server/src/provider/Layers/OpenCodeAdapter.interrupt.test.ts
+          - name: Steering affinity
+            test: apps/server/src/provider/Layers/OpenCodeAdapter.steering-affinity.test.ts
+          - name: Reaper race
+            test: apps/server/src/provider/Layers/ProviderSessionReaper.race.test.ts
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Run focused test
+        run: vp test run ${{ matrix.test }}
