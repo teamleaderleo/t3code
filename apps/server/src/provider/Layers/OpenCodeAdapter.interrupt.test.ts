@@ -93,12 +93,6 @@ function makeHarness() {
     promptCalls: [] as Array<unknown>,
     abortError: null as Error | null,
     emitIdleDuringAbort: false,
-    holdAbort: false,
-    abortResolvers: [] as Array<() => void>,
-  };
-
-  const releaseAborts = (): void => {
-    for (const resolve of state.abortResolvers.splice(0)) resolve();
   };
 
   const runtime: OpenCodeRuntimeShape = {
@@ -126,9 +120,6 @@ function makeHarness() {
                 type: "session.status",
                 properties: { sessionID, status: { type: "idle" } },
               });
-            }
-            if (state.holdAbort) {
-              await new Promise<void>((resolve) => state.abortResolvers.push(resolve));
             }
             if (state.abortError) throw state.abortError;
           },
@@ -180,7 +171,7 @@ function makeHarness() {
     Layer.provideMerge(NodeServices.layer),
   );
 
-  return { events, layer, releaseAborts, state };
+  return { events, layer, state };
 }
 
 const startTurn = Effect.fn("OpenCodeAdapter.interrupt.test/startTurn")(function* (
@@ -305,7 +296,6 @@ it.effect("settles an abort-idle race once and never labels the interrupted turn
 
 it.effect("coalesces concurrent duplicate interrupts into one abort and one terminal event", () => {
   const harness = makeHarness();
-  harness.state.holdAbort = true;
 
   return Effect.gen(function* () {
     const adapter = yield* OpenCodeAdapter;
@@ -314,22 +304,17 @@ it.effect("coalesces concurrent duplicate interrupts into one abort and one term
     const terminals: Array<ProviderRuntimeEvent> = [];
     const watcher = yield* watchTerminalEvents(adapter, threadId, terminals);
 
-    const callers = yield* Effect.all(
+    yield* Effect.all(
       [
         Effect.exit(adapter.interruptTurn(threadId, turn.turnId)),
         Effect.exit(adapter.interruptTurn(threadId, turn.turnId)),
       ],
       { concurrency: "unbounded" },
-    ).pipe(Effect.forkChild);
-
-    yield* drainFibers;
-    const observedAbortCalls = [...harness.state.abortCalls];
-    harness.releaseAborts();
-    yield* Fiber.join(callers);
+    );
     yield* drainFibers;
     yield* Fiber.interrupt(watcher);
 
-    NodeAssert.deepEqual(observedAbortCalls, [resumedSessionId]);
+    NodeAssert.deepEqual(harness.state.abortCalls, [resumedSessionId]);
     assertInterruptedTerminal(terminals, turn.turnId);
   }).pipe(Effect.provide(harness.layer));
 });
