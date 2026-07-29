@@ -40,6 +40,7 @@ function makeHarness() {
   const state = {
     abortCalls: [] as Array<string>,
     abortResolvers: [] as Array<() => void>,
+    promptCalls: [] as Array<unknown>,
   };
 
   const releaseAborts = (): void => {
@@ -61,7 +62,9 @@ function makeHarness() {
         session: {
           get: async ({ sessionID }: { sessionID: string }) => ({ data: { id: sessionID } }),
           update: async ({ sessionID }: { sessionID: string }) => ({ data: { id: sessionID } }),
-          promptAsync: async () => undefined,
+          promptAsync: async (request: unknown) => {
+            state.promptCalls.push(request);
+          },
           abort: async ({ sessionID }: { sessionID: string }) => {
             state.abortCalls.push(sessionID);
             await new Promise<void>((resolve) => state.abortResolvers.push(resolve));
@@ -119,6 +122,25 @@ function makeHarness() {
   return { layer, releaseAborts, state };
 }
 
+const startTurn = Effect.fn("OpenCodeAdapter.interrupt-owner-cancellation.test/startTurn")(
+  function* (adapter: OpenCodeAdapterShape, threadId: ThreadId) {
+    yield* adapter.startSession({
+      provider: ProviderDriverKind.make("opencode"),
+      threadId,
+      runtimeMode: "full-access",
+      resumeCursor: { schemaVersion: 1, sessionId },
+    });
+    return yield* adapter.sendTurn({
+      threadId,
+      input: "cancel the caller while provider abort is in flight",
+      modelSelection: {
+        instanceId: ProviderInstanceId.make("opencode"),
+        model: "openai/gpt-5",
+      },
+    });
+  },
+);
+
 it.effect("continues the owned provider abort after the initiating caller fiber is cancelled", () => {
   const harness = makeHarness();
 
@@ -136,21 +158,7 @@ it.effect("continues the owned provider abort after the initiating caller fiber 
       Effect.forkChild,
     );
 
-    yield* adapter.startSession({
-      provider: ProviderDriverKind.make("opencode"),
-      threadId,
-      runtimeMode: "full-access",
-      resumeCursor: { schemaVersion: 1, sessionId },
-    });
-    const turn = yield* adapter.sendTurn({
-      threadId,
-      input: "cancel the caller while provider abort is in flight",
-      modelSelection: {
-        instanceId: ProviderInstanceId.make("opencode"),
-        model: "openai/gpt-5",
-      },
-    });
-
+    const turn = yield* startTurn(adapter, threadId);
     const caller = yield* adapter.interruptTurn(threadId, turn.turnId).pipe(Effect.forkChild);
     yield* drainFibers;
     NodeAssert.deepEqual(harness.state.abortCalls, [sessionId]);
@@ -173,5 +181,35 @@ it.effect("continues the owned provider abort after the initiating caller fiber 
     const session = sessions.find((entry) => entry.threadId === threadId);
     NodeAssert.equal(session?.status, "ready");
     NodeAssert.equal(session?.activeTurnId, undefined);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("rejects a new prompt while the provider abort operation owns the active turn", () => {
+  const harness = makeHarness();
+
+  return Effect.gen(function* () {
+    const adapter = yield* OpenCodeAdapter;
+    const threadId = ThreadId.make("thread-opencode-send-during-interrupt");
+    const turn = yield* startTurn(adapter, threadId);
+    const caller = yield* adapter.interruptTurn(threadId, turn.turnId).pipe(Effect.forkChild);
+    yield* drainFibers;
+
+    const result = yield* adapter
+      .sendTurn({
+        threadId,
+        input: "this prompt must not race the abort",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("opencode"),
+          model: "openai/gpt-5",
+        },
+      })
+      .pipe(Effect.result);
+
+    harness.releaseAborts();
+    yield* Fiber.join(caller);
+
+    NodeAssert.equal(result._tag, "Failure");
+    NodeAssert.deepEqual(harness.state.abortCalls, [sessionId]);
+    NodeAssert.equal(harness.state.promptCalls.length, 1);
   }).pipe(Effect.provide(harness.layer));
 });
