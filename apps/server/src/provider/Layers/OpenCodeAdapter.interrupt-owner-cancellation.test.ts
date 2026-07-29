@@ -213,3 +213,28 @@ it.effect("rejects a new prompt while the provider abort operation owns the acti
     NodeAssert.equal(harness.state.promptCalls.length, 1);
   }).pipe(Effect.provide(harness.layer));
 });
+
+it.effect("reuses the in-flight provider abort when stopSession races the interrupt", () => {
+  const harness = makeHarness();
+
+  return Effect.gen(function* () {
+    const adapter = yield* OpenCodeAdapter;
+    const threadId = ThreadId.make("thread-opencode-stop-during-interrupt");
+    const turn = yield* startTurn(adapter, threadId);
+    const interruptCaller = yield* adapter
+      .interruptTurn(threadId, turn.turnId)
+      .pipe(Effect.forkChild);
+    yield* drainFibers;
+
+    const stopCaller = yield* adapter.stopSession(threadId).pipe(Effect.forkChild);
+    yield* drainFibers;
+    const abortCallsBeforeRelease = [...harness.state.abortCalls];
+
+    harness.releaseAborts();
+    yield* Fiber.join(interruptCaller).pipe(Effect.ignore);
+    yield* Fiber.join(stopCaller);
+
+    NodeAssert.deepEqual(abortCallsBeforeRelease, [sessionId]);
+    NodeAssert.equal(yield* adapter.hasSession(threadId), false);
+  }).pipe(Effect.provide(harness.layer));
+});
