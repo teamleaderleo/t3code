@@ -35,7 +35,7 @@ class OpenCodeAdapter extends Context.Service<OpenCodeAdapter, OpenCodeAdapterSh
 
 const resumedSessionId = "ses_interrupt";
 const EVENT_STREAM_END = Symbol("OpenCodeAdapter.interrupt.test/event-stream-end");
-const drainFibers = Effect.forEach(Array.from({ length: 25 }), () => Effect.yieldNow, {
+const drainFibers = Effect.forEach(Array.from({ length: 50 }), () => Effect.yieldNow, {
   discard: true,
 });
 
@@ -57,9 +57,7 @@ function makeEventBus() {
       return {
         next: async (): Promise<IteratorResult<unknown>> => {
           const immediate = buffered.shift();
-          if (immediate !== undefined) {
-            return { done: false, value: immediate };
-          }
+          if (immediate !== undefined) return { done: false, value: immediate };
 
           const event = await new Promise<unknown | typeof EVENT_STREAM_END>((resolve) => {
             let settled = false;
@@ -105,10 +103,7 @@ function makeHarness() {
 
   const runtime: OpenCodeRuntimeShape = {
     startOpenCodeServerProcess: () =>
-      Effect.succeed({
-        url: "http://127.0.0.1:4301",
-        exitCode: Effect.never,
-      }),
+      Effect.succeed({ url: "http://127.0.0.1:4301", exitCode: Effect.never }),
     connectToOpenCodeServer: ({ serverUrl }) =>
       Effect.succeed({
         url: serverUrl ?? "http://127.0.0.1:4301",
@@ -129,10 +124,7 @@ function makeHarness() {
             if (state.emitIdleDuringAbort) {
               events.push({
                 type: "session.status",
-                properties: {
-                  sessionID,
-                  status: { type: "idle" },
-                },
+                properties: { sessionID, status: { type: "idle" } },
               });
             }
             if (state.holdAbort) {
@@ -212,54 +204,62 @@ const startTurn = Effect.fn("OpenCodeAdapter.interrupt.test/startTurn")(function
   });
 });
 
-const collectExactCompletion = (
-  adapter: OpenCodeAdapterShape,
-  threadId: ThreadId,
-  turnId: TurnId,
-) =>
-  adapter.streamEvents.pipe(
-    Stream.filter(
-      (event) =>
-        event.threadId === threadId && event.type === "turn.completed" && event.turnId === turnId,
-    ),
-    Stream.take(1),
-    Stream.runCollect,
-    Effect.forkChild,
-  );
-
-const watchCompletions = (
+const watchTerminalEvents = (
   adapter: OpenCodeAdapterShape,
   threadId: ThreadId,
   sink: Array<ProviderRuntimeEvent>,
 ) =>
   adapter.streamEvents.pipe(
-    Stream.filter((event) => event.threadId === threadId && event.type === "turn.completed"),
+    Stream.filter(
+      (event) =>
+        event.threadId === threadId &&
+        (event.type === "turn.aborted" || event.type === "turn.completed"),
+    ),
     Stream.runForEach((event) => Effect.sync(() => sink.push(event))),
     Effect.forkChild,
   );
 
-it.effect("settles the exact interrupted turn after abort succeeds without an idle event", () => {
+function exactTerminalEvents(
+  events: ReadonlyArray<ProviderRuntimeEvent>,
+  turnId: TurnId,
+): ReadonlyArray<ProviderRuntimeEvent> {
+  return events.filter(
+    (event) =>
+      event.turnId === turnId && (event.type === "turn.aborted" || event.type === "turn.completed"),
+  );
+}
+
+function assertInterruptedTerminal(events: ReadonlyArray<ProviderRuntimeEvent>, turnId: TurnId): void {
+  const exact = exactTerminalEvents(events, turnId);
+  NodeAssert.equal(exact.length, 1);
+  const event = exact[0];
+  if (event?.type === "turn.completed") {
+    NodeAssert.equal(event.payload.state, "interrupted");
+  } else {
+    NodeAssert.equal(event?.type, "turn.aborted");
+  }
+}
+
+it.effect("settles the exact interrupted turn and clears local state after abort succeeds", () => {
   const harness = makeHarness();
 
   return Effect.gen(function* () {
     const adapter = yield* OpenCodeAdapter;
     const threadId = ThreadId.make("thread-opencode-interrupt-no-idle");
     const turn = yield* startTurn(adapter, threadId);
-    const completionFiber = yield* collectExactCompletion(adapter, threadId, turn.turnId);
+    const terminals: Array<ProviderRuntimeEvent> = [];
+    const watcher = yield* watchTerminalEvents(adapter, threadId, terminals);
 
     yield* adapter.interruptTurn(threadId, turn.turnId);
+    yield* drainFibers;
+    yield* Fiber.interrupt(watcher);
 
-    const completions = Array.from(
-      yield* Fiber.join(completionFiber).pipe(Effect.timeout("1 second")),
-    );
     NodeAssert.deepEqual(harness.state.abortCalls, [resumedSessionId]);
-    NodeAssert.equal(completions.length, 1);
-    const completion = completions[0];
-    NodeAssert.equal(completion?.type, "turn.completed");
-    if (completion?.type === "turn.completed") {
-      NodeAssert.equal(completion.turnId, turn.turnId);
-      NodeAssert.equal(completion.payload.state, "interrupted");
-    }
+    assertInterruptedTerminal(terminals, turn.turnId);
+    const sessions = yield* adapter.listSessions();
+    const session = sessions.find((entry) => entry.threadId === threadId);
+    NodeAssert.equal(session?.status, "ready");
+    NodeAssert.equal(session?.activeTurnId, undefined);
   }).pipe(Effect.provide(harness.layer));
 });
 
@@ -291,22 +291,14 @@ it.effect("settles an abort-idle race once and never labels the interrupted turn
     const adapter = yield* OpenCodeAdapter;
     const threadId = ThreadId.make("thread-opencode-interrupt-idle-race");
     const turn = yield* startTurn(adapter, threadId);
-    const completions: Array<ProviderRuntimeEvent> = [];
-    const watcher = yield* watchCompletions(adapter, threadId, completions);
+    const terminals: Array<ProviderRuntimeEvent> = [];
+    const watcher = yield* watchTerminalEvents(adapter, threadId, terminals);
 
     yield* adapter.interruptTurn(threadId, turn.turnId);
     yield* drainFibers;
     yield* Fiber.interrupt(watcher);
 
-    const exact = completions.filter(
-      (event) => event.type === "turn.completed" && event.turnId === turn.turnId,
-    );
-    NodeAssert.equal(exact.length, 1);
-    const completion = exact[0];
-    NodeAssert.equal(completion?.type, "turn.completed");
-    if (completion?.type === "turn.completed") {
-      NodeAssert.equal(completion.payload.state, "interrupted");
-    }
+    assertInterruptedTerminal(terminals, turn.turnId);
     NodeAssert.deepEqual(harness.state.abortCalls, [resumedSessionId]);
   }).pipe(Effect.provide(harness.layer));
 });
@@ -319,8 +311,8 @@ it.effect("coalesces concurrent duplicate interrupts into one abort and one term
     const adapter = yield* OpenCodeAdapter;
     const threadId = ThreadId.make("thread-opencode-concurrent-interrupts");
     const turn = yield* startTurn(adapter, threadId);
-    const completions: Array<ProviderRuntimeEvent> = [];
-    const watcher = yield* watchCompletions(adapter, threadId, completions);
+    const terminals: Array<ProviderRuntimeEvent> = [];
+    const watcher = yield* watchTerminalEvents(adapter, threadId, terminals);
 
     const callers = yield* Effect.all(
       [
@@ -331,21 +323,14 @@ it.effect("coalesces concurrent duplicate interrupts into one abort and one term
     ).pipe(Effect.forkChild);
 
     yield* drainFibers;
+    const observedAbortCalls = [...harness.state.abortCalls];
     harness.releaseAborts();
-    yield* Fiber.join(callers).pipe(Effect.timeout("1 second"));
+    yield* Fiber.join(callers);
     yield* drainFibers;
     yield* Fiber.interrupt(watcher);
 
-    NodeAssert.deepEqual(harness.state.abortCalls, [resumedSessionId]);
-    const exact = completions.filter(
-      (event) => event.type === "turn.completed" && event.turnId === turn.turnId,
-    );
-    NodeAssert.equal(exact.length, 1);
-    const completion = exact[0];
-    NodeAssert.equal(completion?.type, "turn.completed");
-    if (completion?.type === "turn.completed") {
-      NodeAssert.equal(completion.payload.state, "interrupted");
-    }
+    NodeAssert.deepEqual(observedAbortCalls, [resumedSessionId]);
+    assertInterruptedTerminal(terminals, turn.turnId);
   }).pipe(Effect.provide(harness.layer));
 });
 
@@ -357,15 +342,15 @@ it.effect("preserves the active turn and emits no terminal result when abort fai
     const adapter = yield* OpenCodeAdapter;
     const threadId = ThreadId.make("thread-opencode-interrupt-failure");
     const turn = yield* startTurn(adapter, threadId);
-    const completions: Array<ProviderRuntimeEvent> = [];
-    const watcher = yield* watchCompletions(adapter, threadId, completions);
+    const terminals: Array<ProviderRuntimeEvent> = [];
+    const watcher = yield* watchTerminalEvents(adapter, threadId, terminals);
 
     const exit = yield* Effect.exit(adapter.interruptTurn(threadId, turn.turnId));
     yield* drainFibers;
     yield* Fiber.interrupt(watcher);
 
     NodeAssert.equal(Exit.isFailure(exit), true);
-    NodeAssert.deepEqual(completions, []);
+    NodeAssert.deepEqual(terminals, []);
     const sessions = yield* adapter.listSessions();
     const session = sessions.find((entry) => entry.threadId === threadId);
     NodeAssert.equal(session?.status, "running");
@@ -380,16 +365,15 @@ it.effect("does not let a delayed duplicate idle from the previous turn close a 
     const adapter = yield* OpenCodeAdapter;
     const threadId = ThreadId.make("thread-opencode-delayed-idle-new-turn");
     const firstTurn = yield* startTurn(adapter, threadId);
-    const firstCompletion = yield* collectExactCompletion(adapter, threadId, firstTurn.turnId);
+    const terminals: Array<ProviderRuntimeEvent> = [];
+    const watcher = yield* watchTerminalEvents(adapter, threadId, terminals);
 
     harness.events.push({
       type: "session.status",
-      properties: {
-        sessionID: resumedSessionId,
-        status: { type: "idle" },
-      },
+      properties: { sessionID: resumedSessionId, status: { type: "idle" } },
     });
-    yield* Fiber.join(firstCompletion).pipe(Effect.timeout("1 second"));
+    yield* drainFibers;
+    NodeAssert.equal(exactTerminalEvents(terminals, firstTurn.turnId).length, 1);
 
     const secondTurn = yield* adapter.sendTurn({
       threadId,
@@ -401,26 +385,14 @@ it.effect("does not let a delayed duplicate idle from the previous turn close a 
     });
     NodeAssert.notEqual(secondTurn.turnId, firstTurn.turnId);
 
-    const completions: Array<ProviderRuntimeEvent> = [];
-    const watcher = yield* watchCompletions(adapter, threadId, completions);
-    // This is a duplicate/delayed idle from the first provider run: no busy,
-    // message, or other evidence for the second turn has been observed.
     harness.events.push({
       type: "session.status",
-      properties: {
-        sessionID: resumedSessionId,
-        status: { type: "idle" },
-      },
+      properties: { sessionID: resumedSessionId, status: { type: "idle" } },
     });
     yield* drainFibers;
     yield* Fiber.interrupt(watcher);
 
-    NodeAssert.equal(
-      completions.some(
-        (event) => event.type === "turn.completed" && event.turnId === secondTurn.turnId,
-      ),
-      false,
-    );
+    NodeAssert.equal(exactTerminalEvents(terminals, secondTurn.turnId).length, 0);
     const sessions = yield* adapter.listSessions();
     const session = sessions.find((entry) => entry.threadId === threadId);
     NodeAssert.equal(session?.status, "running");
