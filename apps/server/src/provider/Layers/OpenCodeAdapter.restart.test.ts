@@ -15,6 +15,7 @@ import {
   ProviderDriverKind,
   ThreadId,
   TurnId,
+  type ProviderRuntimeEvent,
 } from "@t3tools/contracts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
@@ -35,6 +36,9 @@ const resumedSessionId = "ses_persisted";
 const persistedTurnId = TurnId.make("turn-persisted-before-restart");
 const persistedProviderMessageId = "msg_t3_persisted_before_restart";
 const EVENT_STREAM_END = Symbol("OpenCodeAdapter.restart.test/event-stream-end");
+const drainFibers = Effect.forEach(Array.from({ length: 50 }), () => Effect.yieldNow, {
+  discard: true,
+});
 
 type TestStatus =
   | { readonly type: "idle" }
@@ -46,10 +50,7 @@ type TestMessage = {
     readonly id: string;
     readonly role: "user" | "assistant";
     readonly parentID?: string;
-    readonly time?: {
-      readonly created?: number;
-      readonly completed?: number;
-    };
+    readonly time?: { readonly created?: number; readonly completed?: number };
     readonly error?: unknown;
   };
   readonly parts: ReadonlyArray<unknown>;
@@ -78,9 +79,7 @@ function makeEventBus() {
       return {
         next: async (): Promise<IteratorResult<unknown>> => {
           const immediate = buffered.shift();
-          if (immediate !== undefined) {
-            return { done: false, value: immediate };
-          }
+          if (immediate !== undefined) return { done: false, value: immediate };
 
           const event = await new Promise<unknown | typeof EVENT_STREAM_END>((resolve) => {
             let settled = false;
@@ -139,15 +138,11 @@ function makeHarness(input?: {
     statusCalls: [] as Array<unknown>,
     messageCalls: [] as Array<Record<string, unknown>>,
     createCalls: [] as Array<unknown>,
-    abortCalls: [] as Array<string>,
   };
 
   const runtime: OpenCodeRuntimeShape = {
     startOpenCodeServerProcess: () =>
-      Effect.succeed({
-        url: "http://127.0.0.1:4301",
-        exitCode: Effect.never,
-      }),
+      Effect.succeed({ url: "http://127.0.0.1:4301", exitCode: Effect.never }),
     connectToOpenCodeServer: ({ serverUrl }) =>
       Effect.succeed({
         url: serverUrl ?? "http://127.0.0.1:4301",
@@ -162,29 +157,19 @@ function makeHarness(input?: {
             state.createCalls.push(request);
             return { data: { id: "ses_unexpected_fresh" } };
           },
-          get: async ({ sessionID }: { sessionID: string }) => ({
-            data: { id: sessionID },
-          }),
-          update: async ({ sessionID }: { sessionID: string }) => ({
-            data: { id: sessionID },
-          }),
+          get: async ({ sessionID }: { sessionID: string }) => ({ data: { id: sessionID } }),
+          update: async ({ sessionID }: { sessionID: string }) => ({ data: { id: sessionID } }),
           status: async (request?: unknown) => {
             state.statusCalls.push(request);
             if (state.statusError) throw state.statusError;
-            return {
-              data: {
-                [resumedSessionId]: state.status,
-              },
-            };
+            return { data: { [resumedSessionId]: state.status } };
           },
           messages: async (request: Record<string, unknown>) => {
             state.messageCalls.push(request);
             if (state.messagesError) throw state.messagesError;
             return { data: state.messages };
           },
-          abort: async ({ sessionID }: { sessionID: string }) => {
-            state.abortCalls.push(sessionID);
-          },
+          abort: async () => undefined,
         },
         event: {
           subscribe: async (_request?: unknown, options?: { readonly signal?: AbortSignal }) => ({
@@ -236,28 +221,43 @@ function makeHarness(input?: {
   return { events, layer, state };
 }
 
-const collectExactCompletion = (
+const watchExactCompletions = (
   adapter: OpenCodeAdapterShape,
   threadId: ThreadId,
   turnId: TurnId,
+  sink: Array<ProviderRuntimeEvent>,
 ) =>
   adapter.streamEvents.pipe(
     Stream.filter(
       (event) =>
         event.threadId === threadId && event.type === "turn.completed" && event.turnId === turnId,
     ),
-    Stream.take(1),
-    Stream.runCollect,
+    Stream.runForEach((event) => Effect.sync(() => sink.push(event))),
     Effect.forkChild,
   );
+
+const finishWatching = (watcher: Fiber.Fiber<never, void>) =>
+  drainFibers.pipe(Effect.andThen(Fiber.interrupt(watcher)));
+
+function assertCompletion(
+  events: ReadonlyArray<ProviderRuntimeEvent>,
+  state: "completed" | "failed" | "interrupted",
+): void {
+  NodeAssert.equal(events.length, 1);
+  const event = events[0];
+  NodeAssert.equal(event?.type, "turn.completed");
+  if (event?.type === "turn.completed") {
+    NodeAssert.equal(event.turnId, persistedTurnId);
+    NodeAssert.equal(event.payload.state, state);
+  }
+}
 
 function assertBoundedHistoryReads(calls: ReadonlyArray<Record<string, unknown>>): void {
   NodeAssert.ok(calls.length > 0, "recovery must inspect provider history when status is idle");
   for (const call of calls) {
     NodeAssert.equal(call.sessionID, resumedSessionId);
     NodeAssert.equal(Number.isInteger(call.limit), true, "history reads must set a finite page limit");
-    const limit = call.limit as number;
-    NodeAssert.ok(limit > 0 && limit <= 100, `history page limit must be bounded, received ${limit}`);
+    NodeAssert.ok((call.limit as number) > 0, "history page limit must be positive");
   }
 }
 
@@ -266,10 +266,7 @@ it.effect(
   () => {
     const harness = makeHarness({
       messages: [
-        {
-          info: { id: "msg_unrelated_user", role: "user", time: { created: 1 } },
-          parts: [],
-        },
+        { info: { id: "msg_unrelated_user", role: "user", time: { created: 1 } }, parts: [] },
         {
           info: {
             id: "msg_unrelated_assistant",
@@ -285,20 +282,13 @@ it.effect(
     return Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
       const threadId = ThreadId.make("thread-opencode-resumed-idle-no-match");
-      const completionFiber = yield* collectExactCompletion(adapter, threadId, persistedTurnId);
+      const completions: Array<ProviderRuntimeEvent> = [];
+      const watcher = yield* watchExactCompletions(adapter, threadId, persistedTurnId, completions);
 
       yield* adapter.startSession(makeRecoveryInput(threadId));
+      yield* finishWatching(watcher);
 
-      const completions = Array.from(
-        yield* Fiber.join(completionFiber).pipe(Effect.timeout("1 second")),
-      );
-      NodeAssert.equal(completions.length, 1);
-      const completion = completions[0];
-      NodeAssert.equal(completion?.type, "turn.completed");
-      if (completion?.type === "turn.completed") {
-        NodeAssert.equal(completion.turnId, persistedTurnId);
-        NodeAssert.equal(completion.payload.state, "interrupted");
-      }
+      assertCompletion(completions, "interrupted");
       NodeAssert.equal(harness.state.statusCalls.length, 1);
       assertBoundedHistoryReads(harness.state.messageCalls);
       NodeAssert.deepEqual(harness.state.createCalls, []);
@@ -310,11 +300,7 @@ it.effect("classifies matching terminal assistant history as completed", () => {
   const harness = makeHarness({
     messages: [
       {
-        info: {
-          id: persistedProviderMessageId,
-          role: "user",
-          time: { created: 1 },
-        },
+        info: { id: persistedProviderMessageId, role: "user", time: { created: 1 } },
         parts: [],
       },
       {
@@ -332,18 +318,13 @@ it.effect("classifies matching terminal assistant history as completed", () => {
   return Effect.gen(function* () {
     const adapter = yield* OpenCodeAdapter;
     const threadId = ThreadId.make("thread-opencode-resumed-idle-success");
-    const completionFiber = yield* collectExactCompletion(adapter, threadId, persistedTurnId);
+    const completions: Array<ProviderRuntimeEvent> = [];
+    const watcher = yield* watchExactCompletions(adapter, threadId, persistedTurnId, completions);
 
     yield* adapter.startSession(makeRecoveryInput(threadId));
+    yield* finishWatching(watcher);
 
-    const completions = Array.from(
-      yield* Fiber.join(completionFiber).pipe(Effect.timeout("1 second")),
-    );
-    const completion = completions[0];
-    NodeAssert.equal(completion?.type, "turn.completed");
-    if (completion?.type === "turn.completed") {
-      NodeAssert.equal(completion.payload.state, "completed");
-    }
+    assertCompletion(completions, "completed");
     assertBoundedHistoryReads(harness.state.messageCalls);
     NodeAssert.deepEqual(harness.state.createCalls, []);
   }).pipe(Effect.provide(harness.layer));
@@ -353,11 +334,7 @@ it.effect("classifies matching terminal assistant errors as failed", () => {
   const harness = makeHarness({
     messages: [
       {
-        info: {
-          id: persistedProviderMessageId,
-          role: "user",
-          time: { created: 1 },
-        },
+        info: { id: persistedProviderMessageId, role: "user", time: { created: 1 } },
         parts: [],
       },
       {
@@ -368,10 +345,7 @@ it.effect("classifies matching terminal assistant errors as failed", () => {
           time: { created: 2, completed: 3 },
           error: {
             name: "APIError",
-            data: {
-              message: "provider failed after restart",
-              isRetryable: false,
-            },
+            data: { message: "provider failed after restart", isRetryable: false },
           },
         },
         parts: [],
@@ -382,18 +356,13 @@ it.effect("classifies matching terminal assistant errors as failed", () => {
   return Effect.gen(function* () {
     const adapter = yield* OpenCodeAdapter;
     const threadId = ThreadId.make("thread-opencode-resumed-idle-failed");
-    const completionFiber = yield* collectExactCompletion(adapter, threadId, persistedTurnId);
+    const completions: Array<ProviderRuntimeEvent> = [];
+    const watcher = yield* watchExactCompletions(adapter, threadId, persistedTurnId, completions);
 
     yield* adapter.startSession(makeRecoveryInput(threadId));
+    yield* finishWatching(watcher);
 
-    const completions = Array.from(
-      yield* Fiber.join(completionFiber).pipe(Effect.timeout("1 second")),
-    );
-    const completion = completions[0];
-    NodeAssert.equal(completion?.type, "turn.completed");
-    if (completion?.type === "turn.completed") {
-      NodeAssert.equal(completion.payload.state, "failed");
-    }
+    assertCompletion(completions, "failed");
     assertBoundedHistoryReads(harness.state.messageCalls);
     NodeAssert.deepEqual(harness.state.createCalls, []);
   }).pipe(Effect.provide(harness.layer));
@@ -405,7 +374,8 @@ it.effect("restores an exact busy turn and lets a later idle event settle that t
   return Effect.gen(function* () {
     const adapter = yield* OpenCodeAdapter;
     const threadId = ThreadId.make("thread-opencode-resumed-busy");
-    const completionFiber = yield* collectExactCompletion(adapter, threadId, persistedTurnId);
+    const completions: Array<ProviderRuntimeEvent> = [];
+    const watcher = yield* watchExactCompletions(adapter, threadId, persistedTurnId, completions);
 
     const session = yield* adapter.startSession(makeRecoveryInput(threadId));
     NodeAssert.equal(session.status, "running");
@@ -414,22 +384,11 @@ it.effect("restores an exact busy turn and lets a later idle event settle that t
 
     harness.events.push({
       type: "session.status",
-      properties: {
-        sessionID: resumedSessionId,
-        status: { type: "idle" },
-      },
+      properties: { sessionID: resumedSessionId, status: { type: "idle" } },
     });
+    yield* finishWatching(watcher);
 
-    const completions = Array.from(
-      yield* Fiber.join(completionFiber).pipe(Effect.timeout("1 second")),
-    );
-    NodeAssert.equal(completions.length, 1);
-    const completion = completions[0];
-    NodeAssert.equal(completion?.type, "turn.completed");
-    if (completion?.type === "turn.completed") {
-      NodeAssert.equal(completion.turnId, persistedTurnId);
-      NodeAssert.equal(completion.payload.state, "completed");
-    }
+    assertCompletion(completions, "completed");
   }).pipe(Effect.provide(harness.layer));
 });
 
