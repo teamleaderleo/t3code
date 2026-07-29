@@ -3,6 +3,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -14,6 +15,8 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
+  TurnId,
+  type ProviderRuntimeEvent,
 } from "@t3tools/contracts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
@@ -31,134 +34,396 @@ class OpenCodeAdapter extends Context.Service<OpenCodeAdapter, OpenCodeAdapterSh
 ) {}
 
 const resumedSessionId = "ses_interrupt";
-const abortCalls: string[] = [];
+const EVENT_STREAM_END = Symbol("OpenCodeAdapter.interrupt.test/event-stream-end");
+const drainFibers = Effect.forEach(Array.from({ length: 25 }), () => Effect.yieldNow, {
+  discard: true,
+});
 
-const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
-  startOpenCodeServerProcess: () =>
-    Effect.succeed({
-      url: "http://127.0.0.1:4301",
-      exitCode: Effect.never,
-    }),
-  connectToOpenCodeServer: ({ serverUrl }) =>
-    Effect.succeed({
-      url: serverUrl ?? "http://127.0.0.1:4301",
-      exitCode: null,
-      external: true,
-    }),
-  runOpenCodeCommand: () => Effect.succeed({ stdout: "", stderr: "", code: 0 }),
-  createOpenCodeSdkClient: () =>
-    ({
-      session: {
-        get: async ({ sessionID }: { sessionID: string }) => ({ data: { id: sessionID } }),
-        update: async ({ sessionID }: { sessionID: string }) => ({ data: { id: sessionID } }),
-        promptAsync: async () => undefined,
-        abort: async ({ sessionID }: { sessionID: string }) => {
-          abortCalls.push(sessionID);
-          // OpenCode's abort endpoint waits for its runner cancellation path,
-          // whose idle callback updates provider status before the response
-          // returns. This test deliberately withholds SSE delivery so T3 cannot
-          // depend on a later status event for lifecycle settlement.
+function makeEventBus() {
+  const buffered: Array<unknown> = [];
+  const waiters: Array<(event: unknown | typeof EVENT_STREAM_END) => void> = [];
+
+  const push = (event: unknown): void => {
+    const waiter = waiters.shift();
+    if (waiter) {
+      waiter(event);
+      return;
+    }
+    buffered.push(event);
+  };
+
+  const stream = (signal?: AbortSignal): AsyncIterable<unknown> => ({
+    [Symbol.asyncIterator]() {
+      return {
+        next: async (): Promise<IteratorResult<unknown>> => {
+          const immediate = buffered.shift();
+          if (immediate !== undefined) {
+            return { done: false, value: immediate };
+          }
+
+          const event = await new Promise<unknown | typeof EVENT_STREAM_END>((resolve) => {
+            let settled = false;
+            const finish = (value: unknown | typeof EVENT_STREAM_END) => {
+              if (settled) return;
+              settled = true;
+              signal?.removeEventListener("abort", onAbort);
+              const index = waiters.indexOf(finish);
+              if (index >= 0) waiters.splice(index, 1);
+              resolve(value);
+            };
+            const onAbort = () => finish(EVENT_STREAM_END);
+            waiters.push(finish);
+            signal?.addEventListener("abort", onAbort, { once: true });
+            if (signal?.aborted) onAbort();
+          });
+
+          return event === EVENT_STREAM_END
+            ? { done: true, value: undefined }
+            : { done: false, value: event };
         },
-      },
-      event: {
-        subscribe: async () => ({
-          stream: (async function* () {
-            // No provider event is delivered after abort.
-          })(),
+      };
+    },
+  });
+
+  return { push, stream };
+}
+
+function makeHarness() {
+  const events = makeEventBus();
+  const state = {
+    abortCalls: [] as Array<string>,
+    promptCalls: [] as Array<unknown>,
+    abortError: null as Error | null,
+    emitIdleDuringAbort: false,
+    holdAbort: false,
+    abortResolvers: [] as Array<() => void>,
+  };
+
+  const releaseAborts = (): void => {
+    for (const resolve of state.abortResolvers.splice(0)) resolve();
+  };
+
+  const runtime: OpenCodeRuntimeShape = {
+    startOpenCodeServerProcess: () =>
+      Effect.succeed({
+        url: "http://127.0.0.1:4301",
+        exitCode: Effect.never,
+      }),
+    connectToOpenCodeServer: ({ serverUrl }) =>
+      Effect.succeed({
+        url: serverUrl ?? "http://127.0.0.1:4301",
+        exitCode: null,
+        external: true,
+      }),
+    runOpenCodeCommand: () => Effect.succeed({ stdout: "", stderr: "", code: 0 }),
+    createOpenCodeSdkClient: () =>
+      ({
+        session: {
+          get: async ({ sessionID }: { sessionID: string }) => ({ data: { id: sessionID } }),
+          update: async ({ sessionID }: { sessionID: string }) => ({ data: { id: sessionID } }),
+          promptAsync: async (request: unknown) => {
+            state.promptCalls.push(request);
+          },
+          abort: async ({ sessionID }: { sessionID: string }) => {
+            state.abortCalls.push(sessionID);
+            if (state.emitIdleDuringAbort) {
+              events.push({
+                type: "session.status",
+                properties: {
+                  sessionID,
+                  status: { type: "idle" },
+                },
+              });
+            }
+            if (state.holdAbort) {
+              await new Promise<void>((resolve) => state.abortResolvers.push(resolve));
+            }
+            if (state.abortError) throw state.abortError;
+          },
+        },
+        event: {
+          subscribe: async (_request?: unknown, options?: { readonly signal?: AbortSignal }) => ({
+            stream: events.stream(options?.signal),
+          }),
+        },
+      }) as unknown as ReturnType<OpenCodeRuntimeShape["createOpenCodeSdkClient"]>,
+    loadOpenCodeInventory: () =>
+      Effect.fail(
+        new OpenCodeRuntimeError({
+          operation: "loadOpenCodeInventory",
+          detail: "not used in this test",
+          cause: null,
         }),
-      },
-    }) as unknown as ReturnType<OpenCodeRuntimeShape["createOpenCodeSdkClient"]>,
-  loadOpenCodeInventory: () =>
-    Effect.fail(
-      new OpenCodeRuntimeError({
-        operation: "loadOpenCodeInventory",
-        detail: "not used in this test",
-        cause: null,
-      }),
-    ),
-  loadInventoryFromCli: () =>
-    Effect.fail(
-      new OpenCodeRuntimeError({
-        operation: "loadInventoryFromCli",
-        detail: "not used in this test",
-        cause: null,
-      }),
-    ),
-};
+      ),
+    loadInventoryFromCli: () =>
+      Effect.fail(
+        new OpenCodeRuntimeError({
+          operation: "loadInventoryFromCli",
+          detail: "not used in this test",
+          cause: null,
+        }),
+      ),
+  };
 
-const providerSessionDirectoryTestLayer = Layer.succeed(ProviderSessionDirectory, {
-  upsert: () => Effect.void,
-  getProvider: () =>
-    Effect.die(new Error("ProviderSessionDirectory.getProvider is not used in test")),
-  getBinding: () => Effect.succeed(Option.none()),
-  listThreadIds: () => Effect.succeed([]),
-  listBindings: () => Effect.succeed([]),
-});
+  const providerSessionDirectoryTestLayer = Layer.succeed(ProviderSessionDirectory, {
+    upsert: () => Effect.void,
+    getProvider: () =>
+      Effect.die(new Error("ProviderSessionDirectory.getProvider is not used in test")),
+    getBinding: () => Effect.succeed(Option.none()),
+    listThreadIds: () => Effect.succeed([]),
+    listBindings: () => Effect.succeed([]),
+  });
 
-const openCodeAdapterTestSettings = Schema.decodeSync(OpenCodeSettings)({
-  binaryPath: "fake-opencode",
-  serverUrl: "http://127.0.0.1:9999",
-  serverPassword: "secret-password",
-});
+  const settings = Schema.decodeSync(OpenCodeSettings)({
+    binaryPath: "fake-opencode",
+    serverUrl: "http://127.0.0.1:9999",
+    serverPassword: "secret-password",
+  });
 
-const OpenCodeAdapterTestLayer = Layer.effect(
-  OpenCodeAdapter,
-  makeOpenCodeAdapter(openCodeAdapterTestSettings),
-).pipe(
-  Layer.provideMerge(Layer.succeed(OpenCodeRuntime, OpenCodeRuntimeTestDouble)),
-  Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
-  Layer.provideMerge(ServerSettingsService.layerTest()),
-  Layer.provideMerge(providerSessionDirectoryTestLayer),
-  Layer.provideMerge(NodeServices.layer),
-);
-
-it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapter interrupt settlement", (it) => {
-  it.effect("settles the exact interrupted turn after abort succeeds without an idle event", () =>
-    Effect.gen(function* () {
-      abortCalls.length = 0;
-      const adapter = yield* OpenCodeAdapter;
-      const threadId = ThreadId.make("thread-opencode-interrupt");
-
-      yield* adapter.startSession({
-        provider: ProviderDriverKind.make("opencode"),
-        threadId,
-        runtimeMode: "full-access",
-        resumeCursor: { schemaVersion: 1, sessionId: resumedSessionId },
-      });
-
-      const turn = yield* adapter.sendTurn({
-        threadId,
-        input: "keep working until interrupted",
-        modelSelection: {
-          instanceId: ProviderInstanceId.make("opencode"),
-          model: "openai/gpt-5",
-        },
-      });
-
-      const completionFiber = yield* adapter.streamEvents.pipe(
-        Stream.filter(
-          (event) =>
-            event.threadId === threadId &&
-            event.type === "turn.completed" &&
-            event.turnId === turn.turnId,
-        ),
-        Stream.take(1),
-        Stream.runCollect,
-        Effect.forkChild,
-      );
-
-      yield* adapter.interruptTurn(threadId, turn.turnId);
-
-      const events = Array.from(
-        yield* Fiber.join(completionFiber).pipe(Effect.timeout("1 second")),
-      );
-      NodeAssert.deepEqual(abortCalls, [resumedSessionId]);
-      NodeAssert.equal(events.length, 1);
-      NodeAssert.equal(events[0]?.type, "turn.completed");
-      if (events[0]?.type === "turn.completed") {
-        NodeAssert.equal(events[0].turnId, turn.turnId);
-        NodeAssert.equal(events[0].payload.state, "interrupted");
-      }
-    }),
+  const layer = Layer.effect(OpenCodeAdapter, makeOpenCodeAdapter(settings)).pipe(
+    Layer.provideMerge(Layer.succeed(OpenCodeRuntime, runtime)),
+    Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+    Layer.provideMerge(ServerSettingsService.layerTest()),
+    Layer.provideMerge(providerSessionDirectoryTestLayer),
+    Layer.provideMerge(NodeServices.layer),
   );
+
+  return { events, layer, releaseAborts, state };
+}
+
+const startTurn = Effect.fn("OpenCodeAdapter.interrupt.test/startTurn")(function* (
+  adapter: OpenCodeAdapterShape,
+  threadId: ThreadId,
+) {
+  yield* adapter.startSession({
+    provider: ProviderDriverKind.make("opencode"),
+    threadId,
+    runtimeMode: "full-access",
+    resumeCursor: { schemaVersion: 1, sessionId: resumedSessionId },
+  });
+
+  return yield* adapter.sendTurn({
+    threadId,
+    input: "keep working until interrupted",
+    modelSelection: {
+      instanceId: ProviderInstanceId.make("opencode"),
+      model: "openai/gpt-5",
+    },
+  });
+});
+
+const collectExactCompletion = (
+  adapter: OpenCodeAdapterShape,
+  threadId: ThreadId,
+  turnId: TurnId,
+) =>
+  adapter.streamEvents.pipe(
+    Stream.filter(
+      (event) =>
+        event.threadId === threadId && event.type === "turn.completed" && event.turnId === turnId,
+    ),
+    Stream.take(1),
+    Stream.runCollect,
+    Effect.forkChild,
+  );
+
+const watchCompletions = (
+  adapter: OpenCodeAdapterShape,
+  threadId: ThreadId,
+  sink: Array<ProviderRuntimeEvent>,
+) =>
+  adapter.streamEvents.pipe(
+    Stream.filter((event) => event.threadId === threadId && event.type === "turn.completed"),
+    Stream.runForEach((event) => Effect.sync(() => sink.push(event))),
+    Effect.forkChild,
+  );
+
+it.effect("settles the exact interrupted turn after abort succeeds without an idle event", () => {
+  const harness = makeHarness();
+
+  return Effect.gen(function* () {
+    const adapter = yield* OpenCodeAdapter;
+    const threadId = ThreadId.make("thread-opencode-interrupt-no-idle");
+    const turn = yield* startTurn(adapter, threadId);
+    const completionFiber = yield* collectExactCompletion(adapter, threadId, turn.turnId);
+
+    yield* adapter.interruptTurn(threadId, turn.turnId);
+
+    const completions = Array.from(
+      yield* Fiber.join(completionFiber).pipe(Effect.timeout("1 second")),
+    );
+    NodeAssert.deepEqual(harness.state.abortCalls, [resumedSessionId]);
+    NodeAssert.equal(completions.length, 1);
+    const completion = completions[0];
+    NodeAssert.equal(completion?.type, "turn.completed");
+    if (completion?.type === "turn.completed") {
+      NodeAssert.equal(completion.turnId, turn.turnId);
+      NodeAssert.equal(completion.payload.state, "interrupted");
+    }
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("rejects a stale explicit turn id before aborting the current turn", () => {
+  const harness = makeHarness();
+
+  return Effect.gen(function* () {
+    const adapter = yield* OpenCodeAdapter;
+    const threadId = ThreadId.make("thread-opencode-interrupt-stale-id");
+    const turn = yield* startTurn(adapter, threadId);
+    const staleTurnId = TurnId.make("turn-stale-interrupt-request");
+
+    const result = yield* adapter.interruptTurn(threadId, staleTurnId).pipe(Effect.result);
+
+    NodeAssert.equal(result._tag, "Failure");
+    NodeAssert.deepEqual(harness.state.abortCalls, []);
+    const sessions = yield* adapter.listSessions();
+    const session = sessions.find((entry) => entry.threadId === threadId);
+    NodeAssert.equal(session?.status, "running");
+    NodeAssert.equal(session?.activeTurnId, turn.turnId);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("settles an abort-idle race once and never labels the interrupted turn completed", () => {
+  const harness = makeHarness();
+  harness.state.emitIdleDuringAbort = true;
+
+  return Effect.gen(function* () {
+    const adapter = yield* OpenCodeAdapter;
+    const threadId = ThreadId.make("thread-opencode-interrupt-idle-race");
+    const turn = yield* startTurn(adapter, threadId);
+    const completions: Array<ProviderRuntimeEvent> = [];
+    const watcher = yield* watchCompletions(adapter, threadId, completions);
+
+    yield* adapter.interruptTurn(threadId, turn.turnId);
+    yield* drainFibers;
+    yield* Fiber.interrupt(watcher);
+
+    const exact = completions.filter(
+      (event) => event.type === "turn.completed" && event.turnId === turn.turnId,
+    );
+    NodeAssert.equal(exact.length, 1);
+    const completion = exact[0];
+    NodeAssert.equal(completion?.type, "turn.completed");
+    if (completion?.type === "turn.completed") {
+      NodeAssert.equal(completion.payload.state, "interrupted");
+    }
+    NodeAssert.deepEqual(harness.state.abortCalls, [resumedSessionId]);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("coalesces concurrent duplicate interrupts into one abort and one terminal event", () => {
+  const harness = makeHarness();
+  harness.state.holdAbort = true;
+
+  return Effect.gen(function* () {
+    const adapter = yield* OpenCodeAdapter;
+    const threadId = ThreadId.make("thread-opencode-concurrent-interrupts");
+    const turn = yield* startTurn(adapter, threadId);
+    const completions: Array<ProviderRuntimeEvent> = [];
+    const watcher = yield* watchCompletions(adapter, threadId, completions);
+
+    const callers = yield* Effect.all(
+      [
+        Effect.exit(adapter.interruptTurn(threadId, turn.turnId)),
+        Effect.exit(adapter.interruptTurn(threadId, turn.turnId)),
+      ],
+      { concurrency: "unbounded" },
+    ).pipe(Effect.forkChild);
+
+    yield* drainFibers;
+    harness.releaseAborts();
+    yield* Fiber.join(callers).pipe(Effect.timeout("1 second"));
+    yield* drainFibers;
+    yield* Fiber.interrupt(watcher);
+
+    NodeAssert.deepEqual(harness.state.abortCalls, [resumedSessionId]);
+    const exact = completions.filter(
+      (event) => event.type === "turn.completed" && event.turnId === turn.turnId,
+    );
+    NodeAssert.equal(exact.length, 1);
+    const completion = exact[0];
+    NodeAssert.equal(completion?.type, "turn.completed");
+    if (completion?.type === "turn.completed") {
+      NodeAssert.equal(completion.payload.state, "interrupted");
+    }
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("preserves the active turn and emits no terminal result when abort fails", () => {
+  const harness = makeHarness();
+  harness.state.abortError = new Error("abort transport failed", { cause: { status: 503 } });
+
+  return Effect.gen(function* () {
+    const adapter = yield* OpenCodeAdapter;
+    const threadId = ThreadId.make("thread-opencode-interrupt-failure");
+    const turn = yield* startTurn(adapter, threadId);
+    const completions: Array<ProviderRuntimeEvent> = [];
+    const watcher = yield* watchCompletions(adapter, threadId, completions);
+
+    const exit = yield* Effect.exit(adapter.interruptTurn(threadId, turn.turnId));
+    yield* drainFibers;
+    yield* Fiber.interrupt(watcher);
+
+    NodeAssert.equal(Exit.isFailure(exit), true);
+    NodeAssert.deepEqual(completions, []);
+    const sessions = yield* adapter.listSessions();
+    const session = sessions.find((entry) => entry.threadId === threadId);
+    NodeAssert.equal(session?.status, "running");
+    NodeAssert.equal(session?.activeTurnId, turn.turnId);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("does not let a delayed duplicate idle from the previous turn close a newer turn", () => {
+  const harness = makeHarness();
+
+  return Effect.gen(function* () {
+    const adapter = yield* OpenCodeAdapter;
+    const threadId = ThreadId.make("thread-opencode-delayed-idle-new-turn");
+    const firstTurn = yield* startTurn(adapter, threadId);
+    const firstCompletion = yield* collectExactCompletion(adapter, threadId, firstTurn.turnId);
+
+    harness.events.push({
+      type: "session.status",
+      properties: {
+        sessionID: resumedSessionId,
+        status: { type: "idle" },
+      },
+    });
+    yield* Fiber.join(firstCompletion).pipe(Effect.timeout("1 second"));
+
+    const secondTurn = yield* adapter.sendTurn({
+      threadId,
+      input: "start a genuinely new turn",
+      modelSelection: {
+        instanceId: ProviderInstanceId.make("opencode"),
+        model: "openai/gpt-5",
+      },
+    });
+    NodeAssert.notEqual(secondTurn.turnId, firstTurn.turnId);
+
+    const completions: Array<ProviderRuntimeEvent> = [];
+    const watcher = yield* watchCompletions(adapter, threadId, completions);
+    // This is a duplicate/delayed idle from the first provider run: no busy,
+    // message, or other evidence for the second turn has been observed.
+    harness.events.push({
+      type: "session.status",
+      properties: {
+        sessionID: resumedSessionId,
+        status: { type: "idle" },
+      },
+    });
+    yield* drainFibers;
+    yield* Fiber.interrupt(watcher);
+
+    NodeAssert.equal(
+      completions.some(
+        (event) => event.type === "turn.completed" && event.turnId === secondTurn.turnId,
+      ),
+      false,
+    );
+    const sessions = yield* adapter.listSessions();
+    const session = sessions.find((entry) => entry.threadId === threadId);
+    NodeAssert.equal(session?.status, "running");
+    NodeAssert.equal(session?.activeTurnId, secondTurn.turnId);
+  }).pipe(Effect.provide(harness.layer));
 });
