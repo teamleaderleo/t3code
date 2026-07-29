@@ -9,7 +9,12 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
-import { OpenCodeSettings, ProviderDriverKind, ThreadId } from "@t3tools/contracts";
+import {
+  OpenCodeSettings,
+  ProviderDriverKind,
+  ThreadId,
+  TurnId,
+} from "@t3tools/contracts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
@@ -26,6 +31,7 @@ class OpenCodeAdapter extends Context.Service<OpenCodeAdapter, OpenCodeAdapterSh
 ) {}
 
 const resumedSessionId = "ses_persisted";
+const persistedTurnId = TurnId.make("turn-persisted-before-restart");
 
 const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
   startOpenCodeServerProcess: () =>
@@ -45,18 +51,18 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
       session: {
         get: async ({ sessionID }: { sessionID: string }) => ({ data: { id: sessionID } }),
         update: async ({ sessionID }: { sessionID: string }) => ({ data: { id: sessionID } }),
+        status: async () => ({
+          data: {
+            [resumedSessionId]: { type: "idle" },
+          },
+        }),
         abort: async () => undefined,
       },
       event: {
         subscribe: async () => ({
           stream: (async function* () {
-            yield {
-              type: "session.status",
-              properties: {
-                sessionID: resumedSessionId,
-                status: { type: "idle" },
-              },
-            };
+            // Recovery must not depend on a fresh status event. OpenCode exposes
+            // an authoritative session-status snapshot for this purpose.
           })(),
         }),
       },
@@ -106,33 +112,45 @@ const OpenCodeAdapterTestLayer = Layer.effect(
 );
 
 it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapter restart reconciliation", (it) => {
-  it.effect("emits ready when a resumed OpenCode session is already idle", () =>
+  it.effect("completes the exact persisted turn when a resumed session is idle", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
       const threadId = ThreadId.make("thread-opencode-resumed-idle");
-      const readyEventFiber = yield* adapter.streamEvents.pipe(
+      const completionFiber = yield* adapter.streamEvents.pipe(
         Stream.filter(
-          (event) => event.threadId === threadId && event.type === "session.state.changed",
+          (event) =>
+            event.threadId === threadId &&
+            event.type === "turn.completed" &&
+            event.turnId === persistedTurnId,
         ),
         Stream.take(1),
         Stream.runCollect,
         Effect.forkChild,
       );
 
-      yield* adapter.startSession({
+      // This extra field describes the intended internal recovery contract
+      // between ProviderService and provider adapters. It deliberately does not
+      // change the public websocket start-session schema.
+      const recoveryInput = {
         provider: ProviderDriverKind.make("opencode"),
         threadId,
-        runtimeMode: "full-access",
+        runtimeMode: "full-access" as const,
         resumeCursor: { schemaVersion: 1, sessionId: resumedSessionId },
-      });
+        recoveryActiveTurnId: persistedTurnId,
+      } satisfies Parameters<OpenCodeAdapterShape["startSession"]>[0] & {
+        recoveryActiveTurnId: TurnId;
+      };
+
+      yield* adapter.startSession(recoveryInput);
 
       const events = Array.from(
-        yield* Fiber.join(readyEventFiber).pipe(Effect.timeout("1 second")),
+        yield* Fiber.join(completionFiber).pipe(Effect.timeout("1 second")),
       );
       NodeAssert.equal(events.length, 1);
-      NodeAssert.equal(events[0]?.type, "session.state.changed");
-      if (events[0]?.type === "session.state.changed") {
-        NodeAssert.equal(events[0].payload.state, "ready");
+      NodeAssert.equal(events[0]?.type, "turn.completed");
+      if (events[0]?.type === "turn.completed") {
+        NodeAssert.equal(events[0].turnId, persistedTurnId);
+        NodeAssert.equal(events[0].payload.state, "completed");
       }
     }),
   );
