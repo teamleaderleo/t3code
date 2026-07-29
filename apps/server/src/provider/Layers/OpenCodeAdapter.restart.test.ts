@@ -32,6 +32,7 @@ class OpenCodeAdapter extends Context.Service<OpenCodeAdapter, OpenCodeAdapterSh
 
 const resumedSessionId = "ses_persisted";
 const persistedTurnId = TurnId.make("turn-persisted-before-restart");
+const persistedProviderMessageId = "msg_t3_persisted_before_restart";
 
 const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
   startOpenCodeServerProcess: () =>
@@ -56,6 +57,7 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
             [resumedSessionId]: { type: "idle" },
           },
         }),
+        messages: async () => ({ data: [] }),
         abort: async () => undefined,
       },
       event: {
@@ -112,46 +114,50 @@ const OpenCodeAdapterTestLayer = Layer.effect(
 );
 
 it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapter restart reconciliation", (it) => {
-  it.effect("completes the exact persisted turn when a resumed session is idle", () =>
-    Effect.gen(function* () {
-      const adapter = yield* OpenCodeAdapter;
-      const threadId = ThreadId.make("thread-opencode-resumed-idle");
-      const completionFiber = yield* adapter.streamEvents.pipe(
-        Stream.filter(
-          (event) =>
-            event.threadId === threadId &&
-            event.type === "turn.completed" &&
-            event.turnId === persistedTurnId,
-        ),
-        Stream.take(1),
-        Stream.runCollect,
-        Effect.forkChild,
-      );
+  it.effect(
+    "settles the exact persisted turn as interrupted when idle history has no completion evidence",
+    () =>
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const threadId = ThreadId.make("thread-opencode-resumed-idle");
+        const completionFiber = yield* adapter.streamEvents.pipe(
+          Stream.filter(
+            (event) =>
+              event.threadId === threadId &&
+              event.type === "turn.completed" &&
+              event.turnId === persistedTurnId,
+          ),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
 
-      // This extra field describes the intended internal recovery contract
-      // between ProviderService and provider adapters. It deliberately does not
-      // change the public websocket start-session schema.
-      const recoveryInput = {
-        provider: ProviderDriverKind.make("opencode"),
-        threadId,
-        runtimeMode: "full-access" as const,
-        resumeCursor: { schemaVersion: 1, sessionId: resumedSessionId },
-        recoveryActiveTurnId: persistedTurnId,
-      } satisfies Parameters<OpenCodeAdapterShape["startSession"]>[0] & {
-        recoveryActiveTurnId: TurnId;
-      };
+        // These extra fields describe the intended internal recovery contract
+        // between ProviderService and provider adapters. They deliberately do
+        // not change the public websocket start-session schema.
+        const recoveryInput = {
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access" as const,
+          resumeCursor: { schemaVersion: 1, sessionId: resumedSessionId },
+          recoveryActiveTurnId: persistedTurnId,
+          recoveryProviderMessageIds: [persistedProviderMessageId],
+        } satisfies Parameters<OpenCodeAdapterShape["startSession"]>[0] & {
+          recoveryActiveTurnId: TurnId;
+          recoveryProviderMessageIds: ReadonlyArray<string>;
+        };
 
-      yield* adapter.startSession(recoveryInput);
+        yield* adapter.startSession(recoveryInput);
 
-      const events = Array.from(
-        yield* Fiber.join(completionFiber).pipe(Effect.timeout("1 second")),
-      );
-      NodeAssert.equal(events.length, 1);
-      NodeAssert.equal(events[0]?.type, "turn.completed");
-      if (events[0]?.type === "turn.completed") {
-        NodeAssert.equal(events[0].turnId, persistedTurnId);
-        NodeAssert.equal(events[0].payload.state, "completed");
-      }
-    }),
+        const events = Array.from(
+          yield* Fiber.join(completionFiber).pipe(Effect.timeout("1 second")),
+        );
+        NodeAssert.equal(events.length, 1);
+        NodeAssert.equal(events[0]?.type, "turn.completed");
+        if (events[0]?.type === "turn.completed") {
+          NodeAssert.equal(events[0].turnId, persistedTurnId);
+          NodeAssert.equal(events[0].payload.state, "interrupted");
+        }
+      }),
   );
 });
