@@ -61,7 +61,9 @@ function makeRaceAdapter() {
         const now = "2026-07-30T00:00:00.000Z";
         const session: ProviderSession = {
           provider,
-          providerInstanceId: input.providerInstanceId,
+          ...(input.providerInstanceId !== undefined
+            ? { providerInstanceId: input.providerInstanceId }
+            : {}),
           status: "ready",
           runtimeMode: input.runtimeMode,
           threadId: input.threadId,
@@ -160,140 +162,144 @@ function makeThreadShell(activeTurn: TurnId | null) {
   } as never;
 }
 
-it.effect("does not stop a provider session when a new turn starts after the reaper's idle snapshot", () =>
-  Effect.gen(function* () {
-    const firstSnapshotRead = yield* Deferred.make<void>();
-    const releaseFirstSnapshot = yield* Deferred.make<void>();
-    const fake = makeRaceAdapter();
-    let projectionReads = 0;
+it.effect(
+  "does not stop a provider session when a new turn starts after the reaper's idle snapshot",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const firstSnapshotRead = yield* Deferred.make<void>();
+        const releaseFirstSnapshot = yield* Deferred.make<void>();
+        const fake = makeRaceAdapter();
+        let projectionReads = 0;
 
-    const registry = makeAdapterRegistryMock({
-      [provider]: fake.adapter,
-    });
-    const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
-      Layer.provide(SqlitePersistenceMemory),
-    );
-    const directoryLayer = ProviderSessionDirectoryLive.pipe(
-      Layer.provide(runtimeRepositoryLayer),
-    );
-    const projectionLayer = Layer.succeed(ProjectionSnapshotQuery, {
-      getCommandReadModel: () => Effect.die("unused"),
-      getSnapshot: () => Effect.die("unused"),
-      getShellSnapshot: () => Effect.die("unused"),
-      getArchivedShellSnapshot: () => Effect.die("unused"),
-      getSnapshotSequence: () => Effect.succeed({ snapshotSequence: 0 }),
-      getCounts: () => Effect.die("unused"),
-      getActiveProjectByWorkspaceRoot: () => Effect.die("unused"),
-      getProjectShellById: () => Effect.die("unused"),
-      getFirstActiveThreadIdByProjectId: () => Effect.die("unused"),
-      getThreadCheckpointContext: () => Effect.die("unused"),
-      getFullThreadDiffContext: () => Effect.die("unused"),
-      getThreadShellById: () =>
-        Effect.gen(function* () {
-          projectionReads += 1;
-          if (projectionReads === 1) {
-            yield* Deferred.succeed(firstSnapshotRead, undefined);
-            yield* Deferred.await(releaseFirstSnapshot);
-            return Option.some(makeThreadShell(null));
-          }
-          const active = fake.sessions.get(threadId)?.activeTurnId ?? null;
-          return Option.some(makeThreadShell(active));
-        }),
-      getThreadDetailById: () => Effect.die("unused"),
-      getThreadDetailSnapshot: () => Effect.die("unused"),
-    });
+        const registry = makeAdapterRegistryMock({
+          [provider]: fake.adapter,
+        });
+        const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+          Layer.provide(SqlitePersistenceMemory),
+        );
+        const directoryLayer = ProviderSessionDirectoryLive.pipe(
+          Layer.provide(runtimeRepositoryLayer),
+        );
+        const projectionLayer = Layer.succeed(ProjectionSnapshotQuery, {
+          getCommandReadModel: () => Effect.die("unused"),
+          getSnapshot: () => Effect.die("unused"),
+          getShellSnapshot: () => Effect.die("unused"),
+          getArchivedShellSnapshot: () => Effect.die("unused"),
+          getSnapshotSequence: () => Effect.succeed({ snapshotSequence: 0 }),
+          getCounts: () => Effect.die("unused"),
+          getActiveProjectByWorkspaceRoot: () => Effect.die("unused"),
+          getProjectShellById: () => Effect.die("unused"),
+          getFirstActiveThreadIdByProjectId: () => Effect.die("unused"),
+          getThreadCheckpointContext: () => Effect.die("unused"),
+          getFullThreadDiffContext: () => Effect.die("unused"),
+          getThreadShellById: () =>
+            Effect.gen(function* () {
+              projectionReads += 1;
+              if (projectionReads === 1) {
+                yield* Deferred.succeed(firstSnapshotRead, undefined);
+                yield* Deferred.await(releaseFirstSnapshot);
+                return Option.some(makeThreadShell(null));
+              }
+              const active = fake.sessions.get(threadId)?.activeTurnId ?? null;
+              return Option.some(makeThreadShell(active));
+            }),
+          getThreadDetailById: () => Effect.die("unused"),
+          getThreadDetailSnapshot: () => Effect.die("unused"),
+        });
 
-    const providerAdapterLayer = Layer.succeed(
-      ProviderAdapterRegistry.ProviderAdapterRegistry,
-      registry,
-    );
-    const providerLayer = makeProviderServiceLive().pipe(
-      Layer.provide(providerAdapterLayer),
-      Layer.provide(directoryLayer),
-      Layer.provide(ServerSettings.ServerSettingsService.layerTest()),
-      Layer.provide(AnalyticsService.layerTest),
-      Layer.provide(
-        Layer.succeed(
-          ProviderEventLoggers.ProviderEventLoggers,
-          ProviderEventLoggers.NoOpProviderEventLoggers,
-        ),
-      ),
-    );
-    const reaperLayer = makeProviderSessionReaperLive({
-      inactivityThresholdMs: 1,
-      sweepIntervalMs: 60_000,
-    }).pipe(
-      Layer.provide(providerLayer),
-      Layer.provide(directoryLayer),
-      Layer.provide(projectionLayer),
-    );
-    const fullLayer = Layer.mergeAll(
-      providerLayer,
-      reaperLayer,
-      directoryLayer,
-      runtimeRepositoryLayer,
-      NodeServices.layer,
-    );
+        const providerAdapterLayer = Layer.succeed(
+          ProviderAdapterRegistry.ProviderAdapterRegistry,
+          registry,
+        );
+        const providerLayer = makeProviderServiceLive().pipe(
+          Layer.provide(providerAdapterLayer),
+          Layer.provide(directoryLayer),
+          Layer.provide(ServerSettings.ServerSettingsService.layerTest()),
+          Layer.provide(AnalyticsService.layerTest),
+          Layer.provide(
+            Layer.succeed(
+              ProviderEventLoggers.ProviderEventLoggers,
+              ProviderEventLoggers.NoOpProviderEventLoggers,
+            ),
+          ),
+        );
+        const reaperLayer = makeProviderSessionReaperLive({
+          inactivityThresholdMs: 1,
+          sweepIntervalMs: 60_000,
+        }).pipe(
+          Layer.provide(providerLayer),
+          Layer.provide(directoryLayer),
+          Layer.provide(projectionLayer),
+        );
+        const fullLayer = Layer.mergeAll(
+          providerLayer,
+          reaperLayer,
+          directoryLayer,
+          runtimeRepositoryLayer,
+          NodeServices.layer,
+        );
 
-    const scope = yield* Scope.make("sequential");
-    const services = yield* Layer.buildWithScope(fullLayer, scope);
-    const service = yield* ProviderService.ProviderService.pipe(Effect.provide(services));
-    const reaper = yield* ProviderSessionReaper.pipe(Effect.provide(services));
-    const repository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository.pipe(
-      Effect.provide(services),
-    );
+        const scope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+        const services = yield* Layer.buildWithScope(fullLayer, scope);
+        const service = yield* ProviderService.ProviderService.pipe(Effect.provide(services));
+        const reaper = yield* ProviderSessionReaper.pipe(Effect.provide(services));
+        const repository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository.pipe(
+          Effect.provide(services),
+        );
 
-    yield* service.startSession(threadId, {
-      provider,
-      providerInstanceId: instanceId,
-      threadId,
-      runtimeMode: "full-access",
-    });
-    yield* repository.upsert({
-      threadId,
-      providerName: provider,
-      providerInstanceId: instanceId,
-      adapterKey: provider,
-      runtimeMode: "full-access",
-      status: "running",
-      lastSeenAt: "2026-01-01T00:00:00.000Z",
-      resumeCursor: { schemaVersion: 1, sessionId: "ses_reaper_race" },
-      runtimePayload: {
-        activeTurnId: null,
-      },
-    });
+        yield* service.startSession(threadId, {
+          provider,
+          providerInstanceId: instanceId,
+          threadId,
+          runtimeMode: "full-access",
+        });
+        yield* repository.upsert({
+          threadId,
+          providerName: provider,
+          providerInstanceId: instanceId,
+          adapterKey: provider,
+          runtimeMode: "full-access",
+          status: "running",
+          lastSeenAt: "2026-01-01T00:00:00.000Z",
+          resumeCursor: { schemaVersion: 1, sessionId: "ses_reaper_race" },
+          runtimePayload: {
+            activeTurnId: null,
+          },
+        });
 
-    yield* reaper.start().pipe(Scope.provide(scope));
-    yield* Deferred.await(firstSnapshotRead);
+        yield* reaper.start().pipe(Scope.provide(scope));
+        yield* Deferred.await(firstSnapshotRead);
 
-    const turn = yield* service.sendTurn({
-      threadId,
-      input: "start after the stale reaper snapshot",
-      attachments: [],
-      modelSelection: {
-        instanceId,
-        model: "openai/gpt-5",
-      },
-    });
-    NodeAssert.equal(turn.turnId, activeTurnId);
+        const turn = yield* service.sendTurn({
+          threadId,
+          input: "start after the stale reaper snapshot",
+          attachments: [],
+          modelSelection: {
+            instanceId,
+            model: "openai/gpt-5",
+          },
+        });
+        NodeAssert.equal(turn.turnId, activeTurnId);
 
-    yield* Deferred.succeed(releaseFirstSnapshot, undefined);
-    yield* drainFibers;
+        yield* Deferred.succeed(releaseFirstSnapshot, undefined);
+        yield* drainFibers;
 
-    NodeAssert.deepEqual(fake.state.stopCalls, []);
-    NodeAssert.equal(fake.sessions.has(threadId), true);
-    NodeAssert.equal(fake.sessions.get(threadId)?.activeTurnId, activeTurnId);
+        NodeAssert.deepEqual(fake.state.stopCalls, []);
+        NodeAssert.equal(fake.sessions.has(threadId), true);
+        NodeAssert.equal(fake.sessions.get(threadId)?.activeTurnId, activeTurnId);
 
-    const persisted = yield* repository.getByThreadId({ threadId });
-    NodeAssert.equal(Option.isSome(persisted), true);
-    if (Option.isSome(persisted)) {
-      NodeAssert.equal(persisted.value.status, "running");
-      NodeAssert.equal(
-        (persisted.value.runtimePayload as { readonly activeTurnId?: unknown } | null)?.activeTurnId,
-        activeTurnId,
-      );
-    }
-
-    yield* Scope.close(scope, Exit.void);
-  }),
+        const persisted = yield* repository.getByThreadId({ threadId });
+        NodeAssert.equal(Option.isSome(persisted), true);
+        if (Option.isSome(persisted)) {
+          NodeAssert.equal(persisted.value.status, "running");
+          NodeAssert.equal(
+            (persisted.value.runtimePayload as { readonly activeTurnId?: unknown } | null)
+              ?.activeTurnId,
+            activeTurnId,
+          );
+        }
+      }),
+    ),
 );
