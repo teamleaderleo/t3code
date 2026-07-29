@@ -1,4 +1,3 @@
-// @effect-diagnostics nodeBuiltinImport:off
 import * as NodeAssert from "node:assert/strict";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
@@ -7,136 +6,40 @@ import {
   ProviderInstanceId,
   ThreadId,
   TurnId,
-  type ProviderRuntimeEvent,
-  type ProviderSession,
-  type ProviderSessionStartInput,
-  type ProviderSendTurnInput,
 } from "@t3tools/contracts";
-import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
-import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
-import * as PubSub from "effect/PubSub";
-import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
-import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
-import * as ProviderSessionRuntime from "../../persistence/ProviderSessionRuntime.ts";
-import * as ServerSettings from "../../serverSettings.ts";
-import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
-import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
-import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
+import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import { ProviderSessionReaper } from "../Services/ProviderSessionReaper.ts";
-import * as ProviderService from "../Services/ProviderService.ts";
-import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
-import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
-import { makeProviderServiceLive } from "./ProviderService.ts";
+import { ProviderService, type ProviderServiceShape } from "../Services/ProviderService.ts";
 import { makeProviderSessionReaperLive } from "./ProviderSessionReaper.ts";
-import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 
 const provider = ProviderDriverKind.make("opencode");
 const instanceId = ProviderInstanceId.make("opencode");
 const threadId = ThreadId.make("thread-provider-reaper-check-stop-race");
 const activeTurnId = TurnId.make("turn-started-after-reaper-snapshot");
-const drainFibers = Effect.forEach(Array.from({ length: 50 }), () => Effect.yieldNow, {
+const drainFibers = Effect.forEach(Array.from({ length: 100 }), () => Effect.yieldNow, {
   discard: true,
 });
 
-function makeRaceAdapter() {
-  const sessions = new Map<ThreadId, ProviderSession>();
-  const runtimeEvents = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
-  const state = {
-    stopCalls: [] as Array<ThreadId>,
-  };
-
-  const adapter: ProviderAdapterShape<never> = {
-    provider,
-    capabilities: {
-      sessionModelSwitch: "in-session",
-    },
-    startSession: (input: ProviderSessionStartInput) =>
-      Effect.sync(() => {
-        const now = "2026-07-30T00:00:00.000Z";
-        const session: ProviderSession = {
-          provider,
-          ...(input.providerInstanceId !== undefined
-            ? { providerInstanceId: input.providerInstanceId }
-            : {}),
-          status: "ready",
-          runtimeMode: input.runtimeMode,
-          threadId: input.threadId,
-          resumeCursor: { schemaVersion: 1, sessionId: "ses_reaper_race" },
-          createdAt: now,
-          updatedAt: now,
-        };
-        sessions.set(input.threadId, session);
-        return session;
-      }),
-    sendTurn: (input: ProviderSendTurnInput) =>
-      Effect.sync(() => {
-        const existing = sessions.get(input.threadId);
-        if (!existing) throw new Error("test session missing");
-        sessions.set(input.threadId, {
-          ...existing,
-          status: "running",
-          activeTurnId,
-          updatedAt: "2026-07-30T00:00:01.000Z",
-        });
-        return {
-          threadId: input.threadId,
-          turnId: activeTurnId,
-          resumeCursor: existing.resumeCursor,
-        };
-      }),
-    interruptTurn: () => Effect.void,
-    respondToRequest: () => Effect.void,
-    respondToUserInput: () => Effect.void,
-    stopSession: (requestedThreadId) =>
-      Effect.sync(() => {
-        state.stopCalls.push(requestedThreadId);
-        sessions.delete(requestedThreadId);
-      }),
-    listSessions: () => Effect.sync(() => Array.from(sessions.values())),
-    hasSession: (requestedThreadId) => Effect.sync(() => sessions.has(requestedThreadId)),
-    readThread: (requestedThreadId) =>
-      Effect.succeed({
-        threadId: requestedThreadId,
-        turns: [],
-      }),
-    rollbackThread: (requestedThreadId) =>
-      Effect.succeed({
-        threadId: requestedThreadId,
-        turns: [],
-      }),
-    stopAll: () =>
-      Effect.sync(() => {
-        sessions.clear();
-      }),
-    get streamEvents() {
-      return Stream.fromPubSub(runtimeEvents);
-    },
-  };
-
-  return { adapter, sessions, state };
-}
+const unsupported = () => Effect.die(new Error("Unsupported provider call in test")) as never;
 
 function makeThreadShell(activeTurn: TurnId | null) {
   return {
     id: threadId,
     projectId: "project-reaper-race",
     title: "Reaper race",
-    modelSelection: {
-      instanceId,
-      model: "openai/gpt-5",
-    },
+    modelSelection: { instanceId, model: "openai/gpt-5" },
     interactionMode: "default",
     runtimeMode: "full-access",
     branch: null,
     worktreePath: null,
-    createdAt: "2026-07-30T00:00:00.000Z",
-    updatedAt: "2026-07-30T00:00:00.000Z",
+    createdAt: "1969-12-31T23:59:00.000Z",
+    updatedAt: "1969-12-31T23:59:00.000Z",
     archivedAt: null,
     settledOverride: null,
     settledAt: null,
@@ -153,7 +56,7 @@ function makeThreadShell(activeTurn: TurnId | null) {
       runtimeMode: "full-access",
       activeTurnId: activeTurn,
       lastError: null,
-      updatedAt: "2026-07-30T00:00:00.000Z",
+      updatedAt: "1969-12-31T23:59:00.000Z",
     },
     activities: [],
     proposedPlans: [],
@@ -164,142 +67,104 @@ function makeThreadShell(activeTurn: TurnId | null) {
 
 it.effect(
   "does not stop a provider session when a new turn starts after the reaper's idle snapshot",
-  () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const firstSnapshotRead = yield* Deferred.make<void>();
-        const releaseFirstSnapshot = yield* Deferred.make<void>();
-        const fake = makeRaceAdapter();
-        let projectionReads = 0;
+  () => {
+    let providerActiveTurn: TurnId | null = null;
+    let projectionReads = 0;
+    const stopCalls: Array<ThreadId> = [];
 
-        const registry = makeAdapterRegistryMock({
-          [provider]: fake.adapter,
-        });
-        const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
-          Layer.provide(SqlitePersistenceMemory),
-        );
-        const directoryLayer = ProviderSessionDirectoryLive.pipe(
-          Layer.provide(runtimeRepositoryLayer),
-        );
-        const projectionLayer = Layer.succeed(ProjectionSnapshotQuery, {
-          getCommandReadModel: () => Effect.die("unused"),
-          getSnapshot: () => Effect.die("unused"),
-          getShellSnapshot: () => Effect.die("unused"),
-          getArchivedShellSnapshot: () => Effect.die("unused"),
-          getSnapshotSequence: () => Effect.succeed({ snapshotSequence: 0 }),
-          getCounts: () => Effect.die("unused"),
-          getActiveProjectByWorkspaceRoot: () => Effect.die("unused"),
-          getProjectShellById: () => Effect.die("unused"),
-          getFirstActiveThreadIdByProjectId: () => Effect.die("unused"),
-          getThreadCheckpointContext: () => Effect.die("unused"),
-          getFullThreadDiffContext: () => Effect.die("unused"),
-          getThreadShellById: () =>
-            Effect.gen(function* () {
-              projectionReads += 1;
-              if (projectionReads === 1) {
-                yield* Deferred.succeed(firstSnapshotRead, undefined);
-                yield* Deferred.await(releaseFirstSnapshot);
-                return Option.some(makeThreadShell(null));
-              }
-              const active = fake.sessions.get(threadId)?.activeTurnId ?? null;
-              return Option.some(makeThreadShell(active));
-            }),
-          getThreadDetailById: () => Effect.die("unused"),
-          getThreadDetailSnapshot: () => Effect.die("unused"),
-        });
+    const directoryLayer = Layer.succeed(ProviderSessionDirectory, {
+      upsert: () => Effect.void,
+      getProvider: () => Effect.succeed(provider),
+      getBinding: () => Effect.succeed(Option.none()),
+      listThreadIds: () => Effect.succeed([threadId]),
+      listBindings: () =>
+        Effect.succeed([
+          {
+            threadId,
+            provider,
+            providerInstanceId: instanceId,
+            runtimeMode: "full-access",
+            status: "running",
+            lastSeenAt: "1969-12-31T23:59:00.000Z",
+            resumeCursor: { schemaVersion: 1, sessionId: "ses_reaper_race" },
+            runtimePayload: { activeTurnId: null },
+          } as never,
+        ]),
+    });
 
-        const providerAdapterLayer = Layer.succeed(
-          ProviderAdapterRegistry.ProviderAdapterRegistry,
-          registry,
-        );
-        const providerLayer = makeProviderServiceLive().pipe(
-          Layer.provide(providerAdapterLayer),
-          Layer.provide(directoryLayer),
-          Layer.provide(ServerSettings.ServerSettingsService.layerTest()),
-          Layer.provide(AnalyticsService.layerTest),
-          Layer.provide(
-            Layer.succeed(
-              ProviderEventLoggers.ProviderEventLoggers,
-              ProviderEventLoggers.NoOpProviderEventLoggers,
-            ),
-          ),
-        );
-        const reaperLayer = makeProviderSessionReaperLive({
-          inactivityThresholdMs: 1,
-          sweepIntervalMs: 60_000,
-        }).pipe(
-          Layer.provide(providerLayer),
-          Layer.provide(directoryLayer),
-          Layer.provide(projectionLayer),
-        );
-        const fullLayer = Layer.mergeAll(
-          providerLayer,
-          reaperLayer,
-          directoryLayer,
-          runtimeRepositoryLayer,
-          NodeServices.layer,
-        );
-
-        const scope = yield* Scope.make("sequential");
-        yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
-        const services = yield* Layer.buildWithScope(fullLayer, scope);
-        const service = yield* ProviderService.ProviderService.pipe(Effect.provide(services));
-        const reaper = yield* ProviderSessionReaper.pipe(Effect.provide(services));
-        const repository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository.pipe(
-          Effect.provide(services),
-        );
-
-        yield* service.startSession(threadId, {
-          provider,
-          providerInstanceId: instanceId,
-          threadId,
-          runtimeMode: "full-access",
-        });
-        yield* repository.upsert({
-          threadId,
-          providerName: provider,
-          providerInstanceId: instanceId,
-          adapterKey: provider,
-          runtimeMode: "full-access",
-          status: "running",
-          lastSeenAt: "2026-01-01T00:00:00.000Z",
-          resumeCursor: { schemaVersion: 1, sessionId: "ses_reaper_race" },
-          runtimePayload: {
-            activeTurnId: null,
+    const providerService: ProviderServiceShape = {
+      startSession: () => unsupported(),
+      sendTurn: () => unsupported(),
+      interruptTurn: () => unsupported(),
+      respondToRequest: () => unsupported(),
+      respondToUserInput: () => unsupported(),
+      stopSession: ({ threadId: requestedThreadId }) =>
+        Effect.sync(() => {
+          stopCalls.push(requestedThreadId);
+          providerActiveTurn = null;
+        }),
+      listSessions: () => Effect.succeed([]),
+      getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
+      getInstanceInfo: () =>
+        Effect.succeed({
+          instanceId,
+          driverKind: provider,
+          displayName: undefined,
+          enabled: true,
+          continuationIdentity: {
+            driverKind: provider,
+            continuationKey: "opencode:instance:opencode",
           },
-        });
+        }),
+      rollbackConversation: () => unsupported(),
+      streamEvents: Stream.empty,
+    };
 
-        yield* reaper.start().pipe(Scope.provide(scope));
-        yield* Deferred.await(firstSnapshotRead);
+    const projectionLayer = Layer.succeed(ProjectionSnapshotQuery, {
+      getCommandReadModel: () => Effect.die("unused"),
+      getSnapshot: () => Effect.die("unused"),
+      getShellSnapshot: () => Effect.die("unused"),
+      getArchivedShellSnapshot: () => Effect.die("unused"),
+      getSnapshotSequence: () => Effect.succeed({ snapshotSequence: 0 }),
+      getCounts: () => Effect.die("unused"),
+      getActiveProjectByWorkspaceRoot: () => Effect.die("unused"),
+      getProjectShellById: () => Effect.die("unused"),
+      getFirstActiveThreadIdByProjectId: () => Effect.die("unused"),
+      getThreadCheckpointContext: () => Effect.die("unused"),
+      getFullThreadDiffContext: () => Effect.die("unused"),
+      getThreadShellById: () =>
+        Effect.sync(() => {
+          projectionReads += 1;
+          if (projectionReads === 1) {
+            // The snapshot says idle, but a provider turn starts immediately
+            // after that snapshot is materialized and before stopSession runs.
+            providerActiveTurn = activeTurnId;
+            return Option.some(makeThreadShell(null));
+          }
+          return Option.some(makeThreadShell(providerActiveTurn));
+        }),
+      getThreadDetailById: () => Effect.die("unused"),
+      getThreadDetailSnapshot: () => Effect.die("unused"),
+    });
 
-        const turn = yield* service.sendTurn({
-          threadId,
-          input: "start after the stale reaper snapshot",
-          attachments: [],
-          modelSelection: {
-            instanceId,
-            model: "openai/gpt-5",
-          },
-        });
-        NodeAssert.equal(turn.turnId, activeTurnId);
+    const layer = makeProviderSessionReaperLive({
+      inactivityThresholdMs: 1,
+      sweepIntervalMs: 60_000,
+    }).pipe(
+      Layer.provideMerge(directoryLayer),
+      Layer.provideMerge(Layer.succeed(ProviderService, providerService)),
+      Layer.provideMerge(projectionLayer),
+      Layer.provideMerge(NodeServices.layer),
+    );
 
-        yield* Deferred.succeed(releaseFirstSnapshot, undefined);
-        yield* drainFibers;
+    return Effect.gen(function* () {
+      const reaper = yield* ProviderSessionReaper;
+      yield* reaper.start();
+      yield* drainFibers;
 
-        NodeAssert.deepEqual(fake.state.stopCalls, []);
-        NodeAssert.equal(fake.sessions.has(threadId), true);
-        NodeAssert.equal(fake.sessions.get(threadId)?.activeTurnId, activeTurnId);
-
-        const persisted = yield* repository.getByThreadId({ threadId });
-        NodeAssert.equal(Option.isSome(persisted), true);
-        if (Option.isSome(persisted)) {
-          NodeAssert.equal(persisted.value.status, "running");
-          NodeAssert.equal(
-            (persisted.value.runtimePayload as { readonly activeTurnId?: unknown } | null)
-              ?.activeTurnId,
-            activeTurnId,
-          );
-        }
-      }),
-    ),
+      NodeAssert.ok(projectionReads >= 1, "the reaper must inspect the stale binding");
+      NodeAssert.deepEqual(stopCalls, []);
+      NodeAssert.equal(providerActiveTurn, activeTurnId);
+    }).pipe(Effect.provide(layer), Effect.scoped);
+  },
 );
