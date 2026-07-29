@@ -10,13 +10,22 @@ on:
       - apps/server/src/provider/Layers/OpenCodeAdapter.steering-affinity.test.ts
       - apps/server/src/provider/Layers/ProviderSessionReaper.race.test.ts
       - .github/workflows/fieldwork-opencode-lifecycle.yml
+  pull_request:
+    branches:
+      - main
+    paths:
+      - apps/server/src/provider/Layers/OpenCodeAdapter.restart.test.ts
+      - apps/server/src/provider/Layers/OpenCodeAdapter.interrupt.test.ts
+      - apps/server/src/provider/Layers/OpenCodeAdapter.steering-affinity.test.ts
+      - apps/server/src/provider/Layers/ProviderSessionReaper.race.test.ts
+      - .github/workflows/fieldwork-opencode-lifecycle.yml
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: fieldwork-opencode-lifecycle-${{ github.ref }}
+  group: fieldwork-opencode-lifecycle-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
