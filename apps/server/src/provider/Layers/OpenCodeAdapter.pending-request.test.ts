@@ -311,7 +311,11 @@ it.effect("expires pending permission and question handles when the owning turn 
     );
     NodeAssert.equal(permissionResolved?.type, "request.resolved");
     if (permissionResolved?.type === "request.resolved") {
-      NodeAssert.equal(permissionResolved.payload.decision, "decline");
+      NodeAssert.equal(permissionResolved.payload.decision, undefined);
+      NodeAssert.deepEqual(permissionResolved.payload.resolution, {
+        status: "expired",
+        reason: "turn_interrupted",
+      });
     }
 
     const questionResolved = observed.find(
@@ -319,7 +323,15 @@ it.effect("expires pending permission and question handles when the owning turn 
     );
     NodeAssert.equal(questionResolved?.type, "user-input.resolved");
     if (questionResolved?.type === "user-input.resolved") {
-      NodeAssert.deepEqual(questionResolved.payload.answers, {});
+      const payload = questionResolved.payload as {
+        readonly answers: Readonly<Record<string, unknown>>;
+        readonly resolution?: unknown;
+      };
+      NodeAssert.deepEqual(payload.answers, {});
+      NodeAssert.deepEqual(payload.resolution, {
+        status: "expired",
+        reason: "turn_interrupted",
+      });
     }
   }).pipe(Effect.provide(harness.layer));
 });
