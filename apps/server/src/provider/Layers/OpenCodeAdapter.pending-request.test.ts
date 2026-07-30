@@ -93,6 +93,11 @@ function makeHarness() {
     abortCalls: [] as Array<string>,
     permissionReplyCalls: [] as Array<unknown>,
     questionReplyCalls: [] as Array<unknown>,
+    serverExitResolvers: [] as Array<(code: number) => void>,
+  };
+
+  const exitServer = (code = 1): void => {
+    for (const resolve of state.serverExitResolvers.splice(0)) resolve(code);
   };
 
   const runtime: OpenCodeRuntimeShape = {
@@ -101,8 +106,10 @@ function makeHarness() {
     connectToOpenCodeServer: ({ serverUrl }) =>
       Effect.succeed({
         url: serverUrl ?? "http://127.0.0.1:4301",
-        exitCode: null,
-        external: true,
+        exitCode: Effect.promise(
+          () => new Promise<number>((resolve) => state.serverExitResolvers.push(resolve)),
+        ),
+        external: false,
       }),
     runOpenCodeCommand: () => Effect.succeed({ stdout: "", stderr: "", code: 0 }),
     createOpenCodeSdkClient: () =>
@@ -174,7 +181,7 @@ function makeHarness() {
     Layer.provideMerge(NodeServices.layer),
   );
 
-  return { events, layer, state };
+  return { events, exitServer, layer, state };
 }
 
 const startTurn = Effect.fn("OpenCodeAdapter.pending-request.test/startTurn")(function* (
@@ -250,6 +257,39 @@ const pushQuestion = (events: ReturnType<typeof makeEventBus>): void =>
     },
   });
 
+const assertExpiredResolution = (
+  observed: ReadonlyArray<ProviderRuntimeEvent>,
+  reason: "turn_interrupted" | "provider_exited",
+): void => {
+  const permissionResolved = observed.find(
+    (event) => event.type === "request.resolved" && event.requestId === permissionId,
+  );
+  NodeAssert.equal(permissionResolved?.type, "request.resolved");
+  if (permissionResolved?.type === "request.resolved") {
+    NodeAssert.equal(permissionResolved.payload.decision, undefined);
+    NodeAssert.deepEqual(permissionResolved.payload.resolution, {
+      status: "expired",
+      reason,
+    });
+  }
+
+  const questionResolved = observed.find(
+    (event) => event.type === "user-input.resolved" && event.requestId === questionId,
+  );
+  NodeAssert.equal(questionResolved?.type, "user-input.resolved");
+  if (questionResolved?.type === "user-input.resolved") {
+    const payload = questionResolved.payload as {
+      readonly answers: Readonly<Record<string, unknown>>;
+      readonly resolution?: unknown;
+    };
+    NodeAssert.deepEqual(payload.answers, {});
+    NodeAssert.deepEqual(payload.resolution, {
+      status: "expired",
+      reason,
+    });
+  }
+};
+
 it.effect("maps OpenCode skill permission requests to a visible dynamic tool approval", () => {
   const harness = makeHarness();
 
@@ -305,33 +345,46 @@ it.effect("expires pending permission and question handles when the owning turn 
     NodeAssert.deepEqual(harness.state.permissionReplyCalls, []);
     NodeAssert.deepEqual(harness.state.questionReplyCalls, []);
     NodeAssert.deepEqual(harness.state.abortCalls, [sessionId]);
+    assertExpiredResolution(observed, "turn_interrupted");
+  }).pipe(Effect.provide(harness.layer));
+});
 
-    const permissionResolved = observed.find(
+it.effect("expires pending handles before an unexpected provider exit is projected", () => {
+  const harness = makeHarness();
+
+  return Effect.gen(function* () {
+    const adapter = yield* OpenCodeAdapter;
+    const threadId = ThreadId.make("thread-opencode-pending-request-provider-exit");
+    const observed: Array<ProviderRuntimeEvent> = [];
+    const watcher = yield* watchThreadEvents(adapter, threadId, observed);
+
+    yield* startTurn(adapter, threadId);
+    pushSkillPermission(harness.events);
+    pushQuestion(harness.events);
+    yield* drainFibers;
+
+    harness.exitServer(17);
+    yield* drainFibers;
+
+    const stalePermission = yield* adapter
+      .respondToRequest(threadId, permissionId, "decline")
+      .pipe(Effect.result);
+    const staleQuestion = yield* adapter
+      .respondToUserInput(threadId, questionId, {})
+      .pipe(Effect.result);
+    yield* Fiber.interrupt(watcher);
+
+    NodeAssert.equal(stalePermission._tag, "Failure");
+    NodeAssert.equal(staleQuestion._tag, "Failure");
+    NodeAssert.deepEqual(harness.state.permissionReplyCalls, []);
+    NodeAssert.deepEqual(harness.state.questionReplyCalls, []);
+    assertExpiredResolution(observed, "provider_exited");
+
+    const resolutionIndex = observed.findIndex(
       (event) => event.type === "request.resolved" && event.requestId === permissionId,
     );
-    NodeAssert.equal(permissionResolved?.type, "request.resolved");
-    if (permissionResolved?.type === "request.resolved") {
-      NodeAssert.equal(permissionResolved.payload.decision, undefined);
-      NodeAssert.deepEqual(permissionResolved.payload.resolution, {
-        status: "expired",
-        reason: "turn_interrupted",
-      });
-    }
-
-    const questionResolved = observed.find(
-      (event) => event.type === "user-input.resolved" && event.requestId === questionId,
-    );
-    NodeAssert.equal(questionResolved?.type, "user-input.resolved");
-    if (questionResolved?.type === "user-input.resolved") {
-      const payload = questionResolved.payload as {
-        readonly answers: Readonly<Record<string, unknown>>;
-        readonly resolution?: unknown;
-      };
-      NodeAssert.deepEqual(payload.answers, {});
-      NodeAssert.deepEqual(payload.resolution, {
-        status: "expired",
-        reason: "turn_interrupted",
-      });
-    }
+    const exitedIndex = observed.findIndex((event) => event.type === "session.exited");
+    NodeAssert.equal(resolutionIndex >= 0, true);
+    NodeAssert.equal(exitedIndex > resolutionIndex, true);
   }).pipe(Effect.provide(harness.layer));
 });
