@@ -106,7 +106,7 @@ export interface ThreadManagementSendResult {
   readonly projection: OrchestrationV2ThreadProjection;
   readonly message: OrchestrationV2ConversationMessage;
   readonly run: OrchestrationV2Run;
-  readonly turnItem: Extract<OrchestrationV2TurnItem, { readonly type: "user_message" }>;
+  readonly turnItem: Extract<OrchestrationV2TurnItem, { readonly type: "user_message" }> | null;
   readonly delivery: "started" | "queued" | "steered" | "restarted";
 }
 
@@ -511,21 +511,27 @@ const make = Effect.gen(function* () {
         ): candidate is Extract<OrchestrationV2TurnItem, { readonly type: "user_message" }> =>
           candidate.type === "user_message" && candidate.messageId === input.messageId,
       );
-      if (message === undefined || run === undefined || turnItem === undefined) {
+      if (
+        message === undefined ||
+        run === undefined ||
+        (turnItem === undefined && run.status !== "queued")
+      ) {
         return yield* new ThreadManagementDurableRunProjectionError({
           threadId: input.threadId,
           messageId: input.messageId,
         });
       }
       const delivery: ThreadManagementSendResult["delivery"] =
-        turnItem.inputIntent === "turn_start"
-          ? "started"
-          : turnItem.inputIntent === "queued_turn"
-            ? "queued"
-            : input.mode === "restart"
-              ? "restarted"
-              : "steered";
-      return { dispatch, projection, message, run, turnItem, delivery };
+        run.status === "queued"
+          ? "queued"
+          : turnItem?.inputIntent === "turn_start"
+            ? "started"
+            : turnItem?.inputIntent === "queued_turn"
+              ? "queued"
+              : input.mode === "restart"
+                ? "restarted"
+                : "steered";
+      return { dispatch, projection, message, run, turnItem: turnItem ?? null, delivery };
     });
 
   const waitForThread: ThreadManagementServiceShape["waitForThread"] = (input) =>
