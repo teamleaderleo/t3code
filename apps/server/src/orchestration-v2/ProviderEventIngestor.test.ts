@@ -236,7 +236,7 @@ layer("ProviderEventIngestorV2", (it) => {
   it.effect("persists a failed provider terminal as one expected error item", () =>
     Effect.gen(function* () {
       const now = yield* DateTime.now;
-      const retryStartedAt = DateTime.makeUnsafe(DateTime.toEpochMillis(now) - 5_000);
+      const retryStartedAt = DateTime.subtract(now, { seconds: 5 });
       const eventSink = yield* EventSinkV2;
       const projectionStore = yield* ProjectionStoreV2;
       const ingestor = yield* ProviderEventIngestorV2;
@@ -301,6 +301,7 @@ layer("ProviderEventIngestorV2", (it) => {
         maxAttempts: 3,
         retryDelayMs: 2_000,
       });
+      assert.isNotNull(errorItem.startedAt);
       assert.equal(
         DateTime.toEpochMillis(errorItem.startedAt),
         DateTime.toEpochMillis(retryStartedAt),
